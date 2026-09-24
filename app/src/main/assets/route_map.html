@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Маршрут эвакуации</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css"/>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { height:100%; font-family:-apple-system,sans-serif; }
+  #map { width:100%; height:100vh; }
+
+  #info-panel {
+    position:fixed; bottom:0; left:0; right:0;
+    background:#fff; border-radius:20px 20px 0 0;
+    box-shadow:0 -4px 24px rgba(0,0,0,.15);
+    padding:16px 20px 28px; z-index:1000;
+    transition:transform .3s ease;
+  }
+  #info-panel.hidden { transform:translateY(100%); }
+  .panel-handle { width:40px;height:4px;background:#dee2e6;border-radius:2px;margin:0 auto 12px; }
+  .pvr-name  { font-size:16px;font-weight:700;color:#212529;margin-bottom:4px; }
+  .pvr-address { font-size:13px;color:#6c757d;margin-bottom:10px; }
+  .stats-row { display:flex;gap:12px;margin-bottom:12px;flex-wrap:wrap; }
+  .stat-chip { display:flex;align-items:center;gap:6px;background:#f8f9fa;border-radius:20px;padding:6px 12px;font-size:13px;color:#495057; }
+  .pvr-phone { font-size:14px;color:#007AFF;font-weight:600;text-decoration:none;display:block;margin-bottom:14px; }
+
+  #progress-bar-wrap { background:#e9ecef;border-radius:6px;height:6px;margin-bottom:16px;overflow:hidden;display:none; }
+  #progress-bar { height:100%;border-radius:6px;background:linear-gradient(90deg,#3b82f6,#6366f1);transition:width .5s ease; }
+  #loading-text { font-size:13px;color:#6c757d;text-align:center;margin-bottom:12px;display:none; }
+  #error-text   { font-size:13px;color:#dc3545;text-align:center;padding:8px;display:none; }
+  #steps-container { display:none; }
+  #steps-list { max-height:160px;overflow-y:auto; }
+  .step-item { display:flex;gap:10px;padding:7px 0;border-bottom:1px solid #f1f3f5;font-size:13px;color:#495057; }
+  .step-item:last-child { border-bottom:none; }
+  .step-num { width:22px;height:22px;border-radius:50%;background:#3b82f6;color:#fff;font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center;flex-shrink:0; }
+  .step-dist { color:#adb5bd;font-size:11px;margin-top:2px; }
+
+  #gps-badge { position:fixed;top:12px;right:12px;background:rgba(255,255,255,.92);border-radius:20px;padding:5px 10px;font-size:11px;color:#495057;box-shadow:0 1px 4px rgba(0,0,0,.2);z-index:999;display:none;align-items:center;gap:5px; }
+  #gps-dot { width:8px;height:8px;border-radius:50%;background:#adb5bd; }
+  #gps-dot.active { background:#22c55e;animation:pulse 1.5s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="gps-badge"><div id="gps-dot"></div><span id="gps-text">GPS…</span></div>
+<div id="info-panel" class="hidden">
+  <div class="panel-handle"></div>
+  <div class="pvr-name"    id="pvr-name">—</div>
+  <div class="pvr-address" id="pvr-address">—</div>
+  <div class="stats-row">
+    <div class="stat-chip">📏 <span id="stat-dist">—</span></div>
+    <div class="stat-chip">⏱️ <span id="stat-time">—</span></div>
+    <div class="stat-chip">👥 <span id="stat-cap">—</span></div>
+  </div>
+  <a class="pvr-phone" id="pvr-phone" href="#"></a>
+  <div id="progress-bar-wrap"><div id="progress-bar" style="width:0%"></div></div>
+  <div id="loading-text">Строю маршрут…</div>
+  <div id="error-text">Не удалось построить маршрут. Проверьте соединение.</div>
+  <div id="steps-container">
+    <div style="font-size:14px;font-weight:600;color:#343a40;margin-bottom:8px">Как добраться:</div>
+    <div id="steps-list"></div>
+  </div>
+</div>
+
+<script>
+// ── Карта ────────────────────────────────────────────────────────────────────
+const map = L.map('map', { zoomControl:true, attributionControl:false });
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom:18 }).addTo(map);
+
+// ── Иконки ───────────────────────────────────────────────────────────────────
+function makeUserIcon(heading) {
+  if (heading != null) {
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">
+      <g transform="rotate(${heading},16,16)">
+        <polygon points="16,2 22,26 16,22 10,26" fill="#3b82f6" stroke="#fff" stroke-width="2"/>
+      </g></svg>`;
+    return L.divIcon({ html:svg, className:'', iconAnchor:[16,16] });
+  }
+  return L.divIcon({
+    html:'<div style="width:18px;height:18px;border-radius:50%;background:#3b82f6;border:3px solid #fff;box-shadow:0 0 0 3px rgba(59,130,246,.3)"></div>',
+    className:'', iconAnchor:[9,9]
+  });
+}
+function makePvrIcon(selected) {
+  const bg = selected ? '#16a34a' : '#ef4444';
+  return L.divIcon({
+    html:`<div style="width:34px;height:34px;border-radius:50%;background:${bg};border:3px solid #fff;display:flex;align-items:center;justify-content:center;font-size:17px;box-shadow:0 2px 6px rgba(0,0,0,.3)">🏠</div>`,
+    className:'', iconAnchor:[17,17]
+  });
+}
+
+// ── Глобальное состояние ─────────────────────────────────────────────────────
+let userMarker      = null;
+let accuracyCircle  = null;
+let pvrMarkers      = [];
+let routeLayer      = null;
+let routeDataGlobal = null;
+
+// Текущий выбранный ПВР — храним сам объект, а не только индекс
+// Это ключевое исправление: buildRoute всегда работает с зафиксированным объектом
+let activePvr       = null;
+let activeIdx       = -1;
+
+let mapReady        = false;
+let pendingSelectIdx= null;
+let followUser      = false;
+
+// ── initRoute — вызывается один раз после загрузки страницы ─────────────────
+function initRoute(jsonStr) {
+  if (mapReady) return;
+  mapReady = true;
+
+  try {
+    routeDataGlobal = JSON.parse(jsonStr);
+  } catch(e) {
+    console.error('initRoute parse error:', e, jsonStr.substring(0,200));
+    return;
+  }
+
+  const { user_location, destinations } = routeDataGlobal;
+
+  // Маркер пользователя
+  userMarker = L.marker([user_location.lat, user_location.lon], { icon: makeUserIcon(null) })
+    .addTo(map)
+    .bindPopup('📍 Вы здесь');
+  userMarker.on('click', () => {
+    followUser = !followUser;
+    if (followUser) map.setView(userMarker.getLatLng(), 15, { animate:true });
+  });
+
+  // Маркеры ПВР
+  destinations.forEach((pvr, idx) => {
+    const m = L.marker([pvr.lat, pvr.lon], { icon: makePvrIcon(false) })
+      .addTo(map)
+      .bindPopup(`<b>${pvr.name}</b><br>${pvr.address}`);
+    m.on('click', () => selectPvr(idx));
+    pvrMarkers.push(m);
+  });
+
+  // Вписываем все точки
+  const bounds = [[user_location.lat, user_location.lon],
+                  ...destinations.map(d => [d.lat, d.lon])];
+  map.fitBounds(bounds, { padding:[40,40] });
+
+  // Если selectPvr пришёл раньше initRoute — выполняем сейчас
+  if (pendingSelectIdx !== null) {
+    const idx = pendingSelectIdx;
+    pendingSelectIdx = null;
+    selectPvr(idx);
+  }
+}
+
+// ── selectPvr — фиксирует конкретный объект ПВР и запускает buildRoute ───────
+function selectPvr(idx) {
+  if (!mapReady) {
+    // Страница ещё грузится — запомним индекс
+    pendingSelectIdx = idx;
+    return;
+  }
+  if (!routeDataGlobal) return;
+
+  const pvr = routeDataGlobal.destinations[idx];
+  if (!pvr) {
+    console.error('selectPvr: нет ПВР с индексом', idx,
+                  '— destinations:', routeDataGlobal.destinations.length);
+    return;
+  }
+
+  // Фиксируем активный ПВР
+  activePvr = pvr;
+  activeIdx = idx;
+
+  // Обновляем иконки маркеров
+  pvrMarkers.forEach((m, i) => m.setIcon(makePvrIcon(i === idx)));
+
+  // Заполняем панель
+  document.getElementById('pvr-name').textContent    = pvr.name;
+  document.getElementById('pvr-address').textContent = '📍 ' + pvr.address;
+  document.getElementById('stat-dist').textContent   = pvr.distance_km + ' км';
+  document.getElementById('stat-cap').textContent    = pvr.capacity ? pvr.capacity + ' чел.' : '—';
+
+  const phoneEl = document.getElementById('pvr-phone');
+  if (pvr.phone) {
+    const digits = pvr.phone.replace(/\D/g,'');
+    phoneEl.textContent  = '📞 ' + pvr.phone;
+    phoneEl.href         = 'tel:+' + digits;
+    phoneEl.style.display = 'block';
+  } else {
+    phoneEl.style.display = 'none';
+  }
+
+  document.getElementById('info-panel').classList.remove('hidden');
+
+  // Строим маршрут — передаём pvr явно, без чтения через глобал внутри fetch
+  buildRoute(pvr, false);
+}
+
+// ── buildRoute — принимает pvr явным параметром, гонки нет ──────────────────
+function buildRoute(pvr, silent) {
+  if (!pvr) return;
+
+  const from = userMarker
+    ? userMarker.getLatLng()
+    : { lat: routeDataGlobal.user_location.lat, lng: routeDataGlobal.user_location.lon };
+
+  if (!silent) {
+    document.getElementById('steps-container').style.display  = 'none';
+    document.getElementById('error-text').style.display       = 'none';
+    document.getElementById('loading-text').style.display     = 'block';
+    document.getElementById('progress-bar-wrap').style.display = 'block';
+    document.getElementById('progress-bar').style.width       = '0%';
+  }
+
+  if (routeLayer) { map.removeLayer(routeLayer); routeLayer = null; }
+
+  let prog = 0;
+  const pi = setInterval(() => {
+    prog = Math.min(prog + 10, 85);
+    document.getElementById('progress-bar').style.width = prog + '%';
+  }, 200);
+
+  // Координаты назначения берём из локальной переменной pvr — не из глобала
+  const url = `https://router.project-osrm.org/route/v1/driving/` +
+    `${from.lng},${from.lat};${pvr.lon},${pvr.lat}` +
+    `?overview=full&geometries=geojson&steps=true`;
+
+  console.log('buildRoute → ПВР:', pvr.name, '| координаты:', pvr.lat, pvr.lon);
+  console.log('buildRoute → URL:', url);
+
+  fetch(url)
+    .then(r => r.json())
+    .then(data => {
+      clearInterval(pi);
+      document.getElementById('progress-bar').style.width = '100%';
+      setTimeout(() => {
+        document.getElementById('progress-bar-wrap').style.display = 'none';
+        document.getElementById('loading-text').style.display = 'none';
+      }, 300);
+      if (!data.routes || !data.routes.length) throw new Error('no route');
+
+      const route = data.routes[0];
+
+      const distKm = (route.distance/1000).toFixed(1);
+      const mins   = Math.round(route.duration/60);
+      const hrs    = Math.floor(mins/60);
+      document.getElementById('stat-dist').textContent = distKm + ' км';
+      document.getElementById('stat-time').textContent = hrs > 0 ? `${hrs}ч ${mins%60}м` : `${mins} мин`;
+
+      routeLayer = L.geoJSON(route.geometry, {
+        style:{ color:'#3b82f6', weight:5, opacity:0.85 }
+      }).addTo(map);
+
+      if (!silent) map.fitBounds(routeLayer.getBounds(), { padding:[40,130] });
+
+      const steps = route.legs[0].steps.slice(0, 12);
+      document.getElementById('steps-list').innerHTML = steps.map((s, i) => {
+        const d = s.distance < 1000
+          ? Math.round(s.distance) + ' м'
+          : (s.distance/1000).toFixed(1) + ' км';
+        const n = s.name || maneuverText(s.maneuver.type, s.maneuver.modifier);
+        return `<div class="step-item">
+          <div class="step-num">${i+1}</div>
+          <div><div>${n}</div><div class="step-dist">${d}</div></div>
+        </div>`;
+      }).join('');
+      document.getElementById('steps-container').style.display = 'block';
+
+    })
+    .catch(err => {
+      clearInterval(pi);
+      console.error('OSRM error:', err);
+      document.getElementById('progress-bar-wrap').style.display = 'none';
+      document.getElementById('loading-text').style.display = 'none';
+      document.getElementById('error-text').style.display   = 'block';
+    });
+}
+
+// ── GPS-обновление ───────────────────────────────────────────────────────────
+function updateUserLocation(lat, lon, heading, accuracy) {
+  if (!userMarker) return;
+
+  if (heading !== null && heading !== undefined) {
+    userMarker.setIcon(makeUserIcon(heading));
+  }
+  userMarker.setLatLng([lat, lon]);
+
+  if (accuracy && accuracy > 0) {
+    if (accuracyCircle) {
+      accuracyCircle.setLatLng([lat, lon]).setRadius(accuracy);
+    } else {
+      accuracyCircle = L.circle([lat, lon], {
+        radius:accuracy, color:'#3b82f6', fillColor:'#3b82f6',
+        fillOpacity:0.08, weight:1
+      }).addTo(map);
+    }
+  }
+
+  const badge = document.getElementById('gps-badge');
+  badge.style.display = 'flex';
+  document.getElementById('gps-dot').className = 'active';
+  document.getElementById('gps-text').textContent = accuracy ? `GPS ±${Math.round(accuracy)}м` : 'GPS';
+
+  if (followUser) map.setView([lat, lon], map.getZoom(), { animate:true });
+}
+
+// ── Геометрия ────────────────────────────────────────────────────────────────
+function distanceToRoute(lat, lon, coords) {
+  let min = Infinity;
+  for (let i = 0; i < coords.length - 1; i++) {
+    const d = ptSegDist(lat, lon, coords[i][1], coords[i][0], coords[i+1][1], coords[i+1][0]);
+    if (d < min) min = d;
+  }
+  return min;
+}
+
+function ptSegDist(px, py, ax, ay, bx, by) {
+  const R = 6371000, rad = d => d * Math.PI / 180;
+  const cx  = Math.cos(rad((ax+bx)/2));
+  const apx = (px-ax)*rad(1)*R*cx, apy = (py-ay)*rad(1)*R;
+  const abx = (bx-ax)*rad(1)*R*cx, aby = (by-ay)*rad(1)*R;
+  const ab2 = abx*abx + aby*aby;
+  if (ab2 === 0) return Math.sqrt(apx*apx + apy*apy);
+  const t  = Math.max(0, Math.min(1, (apx*abx + apy*aby) / ab2));
+  const dx = apx - t*abx, dy = apy - t*aby;
+  return Math.sqrt(dx*dx + dy*dy);
+}
+
+function maneuverText(type, mod) {
+  const m = {
+    turn:{ left:'Повернуть налево', right:'Повернуть направо', straight:'Прямо',
+           'slight left':'Слегка налево', 'slight right':'Слегка направо',
+           'sharp left':'Резко налево',   'sharp right':'Резко направо' },
+    roundabout:{ undefined:'Въезд на кольцо' },
+    arrive:    { undefined:'Вы прибыли' },
+    depart:    { undefined:'Начало маршрута' }
+  };
+  return (m[type] && m[type][mod]) || (m[type] && m[type]['undefined']) || 'Продолжить движение';
+}
+</script>
+</body>
+</html>
